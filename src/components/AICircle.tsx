@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Mic, MicOff, Volume2 } from 'lucide-react';
-import { Button } from '@/components/ui/button';
+import { Button } from '@/components/jarvis_ui/button';
 import { useToast } from '@/hooks/use-toast';
 
 // Extend Window interface for Speech Recognition
