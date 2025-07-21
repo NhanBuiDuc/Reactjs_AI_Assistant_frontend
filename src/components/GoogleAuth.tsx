@@ -14,129 +14,154 @@ interface User {
   tokenValid?: boolean;
 }
 
-interface GmailData {
-  profile: {
-    messages_total: number;
-    threads_total: number;
-  };
-  messages: Array<{
-    id: string;
-    subject: string;
-    from: string;
-    snippet: string;
-  }>;
-  lastUpdated?: string;
-}
-
 interface GoogleAuthProps {
   onAuthSuccess?: (user: User) => void;
   onSignOut?: () => void;
 }
 
 const DJANGO_BASE_URL = 'http://localhost:8000';
+const TOKEN_KEY = 'deeptalk_token';
+const TOKEN_TIMESTAMP_KEY = 'deeptalk_token_timestamp';
+const TOKEN_EXPIRY_DAYS = 7;
 
 const GoogleAuth: React.FC<GoogleAuthProps> = ({ onAuthSuccess, onSignOut }) => {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
-  const [token, setToken] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [showDashboard, setShowDashboard] = useState<boolean>(false);
+  const [authMethod, setAuthMethod] = useState<'token' | 'session' | null>(null);
 
   useEffect(() => {
-    checkExistingAuth();
+    initializeAuth();
   }, []);
 
-  const checkExistingAuth = async (): Promise<void> => {
-    console.log('🔍 Starting authentication check...');
+  const initializeAuth = async (): Promise<void> => {
+    console.log('🔍 Starting authentication initialization...');
     setLoading(true);
     setError(null);
     
     try {
-      // Check for token in URL params (from Django callback)
-      const urlParams = new URLSearchParams(window.location.search);
-      const urlToken = urlParams.get('token');
-      
+      // Priority 1: Check for token in URL (from OAuth callback)
+      const urlToken = getTokenFromURL();
       if (urlToken) {
-        console.log('✅ Found token in URL, verifying...', urlToken.substring(0, 20) + '...');
-        setToken(urlToken);
-        
-        // STANDARDIZE: Always use 'deeptalk_token' as the key
-        localStorage.setItem('deeptalk_token', urlToken);
-        localStorage.setItem('deeptalk_token_timestamp', Date.now().toString());
-        
-        // Clean up old token if it exists
-        localStorage.removeItem('gmail_token');
-        localStorage.removeItem('gmail_token_timestamp');
-        
-        const isValid = await verifyToken(urlToken);
-        if (isValid) {
-          console.log('✅ Token verification successful, should show dashboard');
-          // Clean up URL after successful verification
-          window.history.replaceState({}, document.title, window.location.pathname);
-          return;
-        } else {
-          console.error('❌ Token verification failed');
-          cleanupAllTokens();
-        }
+        console.log('✅ Found token in URL, processing...');
+        await processNewToken(urlToken);
+        return;
       }
-      
-      // Check for stored token with both possible keys (for migration)
-      let storedToken = localStorage.getItem('deeptalk_token') || localStorage.getItem('gmail_token');
-      let tokenTimestamp = localStorage.getItem('deeptalk_token_timestamp') || localStorage.getItem('gmail_token_timestamp');
-      
-      if (storedToken && tokenTimestamp) {
-        const tokenAge = Date.now() - parseInt(tokenTimestamp);
-        const sevenDays = 7 * 24 * 60 * 60 * 1000;
-        
-        if (tokenAge < sevenDays) {
-          console.log('🔄 Found valid stored token, verifying...');
-          setToken(storedToken);
-          
-          // Migrate to consistent key if needed
-          if (localStorage.getItem('gmail_token')) {
-            localStorage.setItem('deeptalk_token', storedToken);
-            localStorage.setItem('deeptalk_token_timestamp', tokenTimestamp);
-            localStorage.removeItem('gmail_token');
-            localStorage.removeItem('gmail_token_timestamp');
-          }
-          
-          const isValid = await verifyToken(storedToken);
-          if (isValid) {
-            return;
-          }
-        }
-        
-        // Token is expired, clean up everything
-        console.log('🧹 Token expired, cleaning up...');
-        cleanupAllTokens();
-        setToken(null);
+
+      // Priority 2: Check for valid stored token
+      const storedToken = getValidStoredToken();
+      if (storedToken) {
+        console.log('✅ Found valid stored token, verifying...');
+        const success = await verifyTokenAuth(storedToken);
+        if (success) return;
       }
-      
-      // Check session authentication
+
+      // Priority 3: Check session authentication
       console.log('🔍 Checking session authentication...');
-      await checkSessionAuth();
+      const sessionValid = await verifySessionAuth();
+      if (sessionValid) return;
+
+      // No valid authentication found
+      console.log('❌ No valid authentication found');
       
     } catch (error) {
-      console.error('❌ Error during auth check:', error);
-      setError('Authentication check failed. Please try signing in again.');
+      console.error('❌ Error during auth initialization:', error);
+      setError('Authentication failed. Please try signing in again.');
     }
     
     setLoading(false);
   };
 
-  const cleanupAllTokens = (): void => {
-    // Remove all possible token keys
-    localStorage.removeItem('deeptalk_token');
-    localStorage.removeItem('deeptalk_token_timestamp');
-    localStorage.removeItem('gmail_token');
-    localStorage.removeItem('gmail_token_timestamp');
-    
-    console.log('🧹 All tokens cleaned up');
+  const getTokenFromURL = (): string | null => {
+    const urlParams = new URLSearchParams(window.location.search);
+    return urlParams.get('token');
   };
 
-  const checkSessionAuth = async (): Promise<boolean> => {
+  const getValidStoredToken = (): string | null => {
+    const token = localStorage.getItem(TOKEN_KEY);
+    const timestamp = localStorage.getItem(TOKEN_TIMESTAMP_KEY);
+    
+    if (!token || !timestamp) {
+      cleanupStoredTokens();
+      return null;
+    }
+
+    const tokenAge = Date.now() - parseInt(timestamp);
+    const maxAge = TOKEN_EXPIRY_DAYS * 24 * 60 * 60 * 1000;
+    
+    if (tokenAge >= maxAge) {
+      console.log('🧹 Token expired, cleaning up...');
+      cleanupStoredTokens();
+      return null;
+    }
+
+    return token;
+  };
+
+  const processNewToken = async (token: string): Promise<void> => {
     try {
+      // Store the new token
+      localStorage.setItem(TOKEN_KEY, token);
+      localStorage.setItem(TOKEN_TIMESTAMP_KEY, Date.now().toString());
+      
+      // Clean up URL
+      window.history.replaceState({}, document.title, window.location.pathname);
+      
+      // Verify the token
+      const success = await verifyTokenAuth(token);
+      if (!success) {
+        cleanupStoredTokens();
+        throw new Error('Token verification failed');
+      }
+      
+    } catch (error) {
+      console.error('❌ Failed to process new token:', error);
+      cleanupStoredTokens();
+      setError('Failed to process authentication token. Please try again.');
+      setLoading(false);
+    }
+  };
+
+  const verifyTokenAuth = async (token: string): Promise<boolean> => {
+    try {
+      console.log('🔐 Verifying token authentication...');
+      
       const response = await fetch(`${DJANGO_BASE_URL}/auth/verify-token/`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        credentials: 'include',
+        body: JSON.stringify({ token }),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        console.log('✅ Token authentication successful');
+        
+        const userData = createUserData(data, 'token');
+        setUser(userData);
+        setAuthMethod('token');
+        setLoading(false);
+        onAuthSuccess?.(userData);
+        
+        return true;
+      } else {
+        const errorData = await response.json();
+        console.error('❌ Token verification failed:', errorData);
+        return false;
+      }
+    } catch (error) {
+      console.error('❌ Token verification error:', error);
+      return false;
+    }
+  };
+
+  const verifySessionAuth = async (): Promise<boolean> => {
+    try {
+      console.log('🔐 Verifying session authentication...');
+      
+      const response = await fetch(`${DJANGO_BASE_URL}/auth/verify-session/`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -149,83 +174,44 @@ const GoogleAuth: React.FC<GoogleAuthProps> = ({ onAuthSuccess, onSignOut }) => 
         const data = await response.json();
         console.log('✅ Session authentication successful');
         
-        const userData: User = {
-          id: data.user_id,
-          email: data.email,
-          name: data.email.split('@')[0],
-          firstName: data.first_name || data.email.split('@')[0],
-          lastName: data.last_name || '',
-          avatar: `https://ui-avatars.com/api/?name=${encodeURIComponent(data.email.split('@')[0])}&background=6366f1&color=fff&size=100`,
-          loginMethod: data.login_method,
-          sessionActive: true
-        };
-        
-        console.log('👤 Setting user data:', userData);
+        const userData = createUserData(data, 'session');
         setUser(userData);
-        setShowDashboard(true);
-        onAuthSuccess?.(userData);
-        return true;
-      }
-    } catch (error) {
-      console.log('ℹ️ No existing session found:', error);
-    }
-    
-    return false;
-  };
-
-  const verifyToken = async (jwtToken: string): Promise<boolean> => {
-    try {
-      console.log('🔐 Verifying token with backend...');
-      const response = await fetch(`${DJANGO_BASE_URL}/auth/verify-token/`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        credentials: 'include',
-        body: JSON.stringify({ token: jwtToken }),
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        console.log('✅ Token verification successful, backend response:', data);
-        
-        const userData: User = {
-          id: data.user_id,
-          email: data.email,
-          name: data.email.split('@')[0],
-          firstName: data.first_name || data.email.split('@')[0],
-          lastName: data.last_name || '',
-          avatar: `https://ui-avatars.com/api/?name=${encodeURIComponent(data.email.split('@')[0])}&background=6366f1&color=fff&size=100`,
-          loginMethod: data.login_method,
-          tokenValid: true
-        };
-        
-        console.log('👤 Setting user data from token:', userData);
-        
-        // Set all state in the correct order
-        setUser(userData);
-        setShowDashboard(true);
+        setAuthMethod('session');
         setLoading(false);
-        setError(null);
-        
-        // Call onAuthSuccess callback
         onAuthSuccess?.(userData);
         
-        console.log('🎉 Authentication complete, dashboard should show');
         return true;
       } else {
-        const errorData = await response.json();
-        console.error('❌ Token verification failed:', errorData);
-        setError(errorData.error || 'Token verification failed');
-        setLoading(false);
+        console.log('ℹ️ No valid session found');
         return false;
       }
     } catch (error) {
-      console.error('❌ Token verification error:', error);
-      setError('Network error during token verification');
-      setLoading(false);
+      console.log('ℹ️ Session verification failed:', error);
       return false;
     }
+  };
+
+  const createUserData = (data: any, loginMethod: 'token' | 'session'): User => {
+    return {
+      id: data.user_id,
+      email: data.email,
+      name: data.email.split('@')[0],
+      firstName: data.first_name || data.email.split('@')[0],
+      lastName: data.last_name || '',
+      avatar: `https://ui-avatars.com/api/?name=${encodeURIComponent(data.email.split('@')[0])}&background=6366f1&color=fff&size=100`,
+      loginMethod,
+      sessionActive: loginMethod === 'session',
+      tokenValid: loginMethod === 'token'
+    };
+  };
+
+  const cleanupStoredTokens = (): void => {
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(TOKEN_TIMESTAMP_KEY);
+    // Clean up legacy tokens
+    localStorage.removeItem('gmail_token');
+    localStorage.removeItem('gmail_token_timestamp');
+    console.log('🧹 Stored tokens cleaned up');
   };
 
   const handleGoogleSignIn = async (): Promise<void> => {
@@ -258,6 +244,7 @@ const GoogleAuth: React.FC<GoogleAuthProps> = ({ onAuthSuccess, onSignOut }) => 
     setLoading(true);
     
     try {
+      // Logout from backend (clears session)
       await fetch(`${DJANGO_BASE_URL}/auth/logout/`, {
         method: 'POST',
         credentials: 'include',
@@ -266,28 +253,27 @@ const GoogleAuth: React.FC<GoogleAuthProps> = ({ onAuthSuccess, onSignOut }) => 
       console.error('❌ Backend logout error:', error);
     }
     
-    cleanupAllTokens();
-    // Clear local state
+    // Clean up local state
+    cleanupStoredTokens();
     setUser(null);
-    setToken(null);
+    setAuthMethod(null);
     setError(null);
-    setShowDashboard(false);
     setLoading(false);
     onSignOut?.();
   };
 
-  // Debug logging for render decisions
+  // Debug logging
   console.log('🎨 Render state:', { 
-    showDashboard, 
     user: !!user, 
     loading, 
     error,
+    authMethod,
     userEmail: user?.email 
   });
 
   // Show Dashboard if authenticated
-  if (showDashboard && user) {
-    console.log('📱 Rendering Dashboard for user:', user.email);
+  if (user && !loading) {
+    console.log(`📱 Rendering Dashboard for user: ${user.email} (${authMethod} auth)`);
     return <Dashboard user={user} onSignOut={handleSignOut} />;
   }
 
@@ -307,6 +293,11 @@ const GoogleAuth: React.FC<GoogleAuthProps> = ({ onAuthSuccess, onSignOut }) => 
             <div className="w-10 h-10 border-3 border-gray-300 border-t-indigo-600 rounded-full animate-spin mx-auto mb-5" />
             <h3 className="text-xl font-semibold text-gray-900 mb-2">Welcome to DeepTalk</h3>
             <p className="text-gray-600">Checking your authentication...</p>
+            {authMethod && (
+              <p className="text-sm text-gray-500 mt-2">
+                Authenticating via {authMethod}...
+              </p>
+            )}
           </div>
         </div>
       </div>
